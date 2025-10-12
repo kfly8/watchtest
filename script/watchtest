@@ -1,0 +1,220 @@
+#!/usr/bin/env perl
+use v5.40;
+use experimental qw(class);
+use JSON::PP qw(decode_json);
+use Cwd qw(getcwd);
+use Getopt::Long::Parser ();
+
+use constant { INFO => 0, WARN => 1, ERROR => 2 };
+
+main(@ARGV);
+
+sub main(@args) {
+
+    my @commands;
+    my $p = Getopt::Long::Parser->new(
+        config => [ "no_ignore_case", "pass_through" ],
+    );
+    $p->getoptionsfromarray(
+        \@args,
+        "h|help" => sub { unshift @commands, 'help' },
+    );
+
+    my $code = 0;
+
+    push @commands, @args;
+
+    try {
+        my $subcommand = $commands[0] // 'help';
+        my $method = __PACKAGE__->can('cmd_' . $subcommand);
+        if ($method) {
+            $method->(@commands[1..$#commands]);
+        }
+        elsif (@commands) {
+            cmd_watch(@commands);
+        }
+        else {
+            WatchTest::Error::CommandNotFound->throw("Unknown command: $subcommand");
+        }
+    } catch ($err) {
+        if ($err isa WatchTest::Error::CommandNotFound) {
+            output(WARN, $err->message ."\n\n");
+            cmd_help();
+            $code = 255;
+        }
+        elsif ($err isa WatchTest::Error) {
+            output(WARN, $err->message);
+            $code = 255;
+        }
+        else {
+            die $err;
+        }
+    }
+
+    return $code;
+}
+
+sub cmd_help(@commands) {
+    output(INFO, <<'HELP');
+Usage: watchtest [options] <command> [<args>...]
+
+Options:
+    --help, -h          Show this help message
+
+Examples:
+    watchtest -- prove -lvr    Watch pm,t files and run `prove -lvr` on changes
+HELP
+}
+
+sub cmd_watch(@commands) {
+    unless (is_installed('watchexec')) {
+        WatchTest::Error::RequiredCommandNotInstalled->throw("'watchexec' is not installed. Here are some installation instructions: 'https://github.com/watchexec/watchexec'");
+    }
+
+    output(INFO, "Starting watchexec to monitor pm,t files...\n");
+
+    # Watch all pm,t files
+    exec 'watchexec',
+        '--postpone',
+        '-e', 'pm,t',
+        '--emit-events-to=json-stdio',
+        '--',
+        'watchtest',
+        'on_emit_events',
+        @commands
+}
+
+sub cmd_on_emit_events(@commands) {
+    my $err;
+
+    my $cwd = getcwd();
+
+    (my $changed_files, $err) = read_changed_files_from_event_emits($cwd);
+    if ($err) {
+        $err->rethrow;
+    }
+
+    unless (@$changed_files) {
+        output(INFO, "No changed files detected from watchexec events");
+        return;
+    }
+
+    (my $test_files, $err) = determine_test_files_to_run(@$changed_files);
+    if ($err) {
+        $err->rethrow;
+    }
+
+    unless (@$test_files) {
+        output(INFO, "No relevant test files to run based on changed files");
+        return;
+    }
+
+    # special case
+    shift @commands if $commands[0] eq '--';
+
+    exec @commands, @$test_files;
+}
+
+
+##############################################
+# Following are helper functions
+
+
+# Read JSON events from stdin (watchexec --emit-events-to=json-stdio)
+sub read_changed_files_from_event_emits($cwd) {
+    die "Must be called in list context" unless wantarray;
+
+    my @changed_files;
+
+    while (my $line = <STDIN>) {
+        chomp $line;
+
+        my $event = eval { decode_json($line) };
+        if ($@) {
+            return (undef, WatchTest::Error::UnexpectedEmitJSON->new(message => "Failed to parse JSON from watchexec event: $@"));
+        }
+
+        # Extract paths from the event
+        # Format: {"tags":[{"kind":"path","absolute":"/absolute/path/to/file","filetype":"file"},...]}
+        for my $tag ($event->{tags}->@*) {
+            next unless $tag->{kind} eq 'path';
+
+            if (my $path = $tag->{absolute}) {
+                # Convert absolute path to relative path
+                if ($path =~ m{^\Q$cwd\E/(.+)}) {
+                    push @changed_files, $1;
+                } elsif ($path !~ m{^/}) {
+                    push @changed_files, $path;
+                }
+            }
+        }
+    }
+
+    return (\@changed_files, undef);
+}
+
+# Determine which test files to run based on changed files
+sub determine_test_files_to_run(@changed_files) {
+    die "Must be called in list context" unless wantarray;
+
+    my @test_files;
+
+    for my $file (@changed_files) {
+        $file =~ s/^\s+|\s+$//g;  # trim whitespace
+        next unless $file;
+
+        if ($file =~ /\.t$/) {
+            # Test file changed, run it directly
+            push @test_files, $file;
+        }
+        elsif ($file =~ m{^lib/(.+)\.pm$}) {
+            # Module file changed in lib/, find corresponding test
+            # lib/Hoge/Fuga.pm -> t/Hoge/Fuga.t
+            # or
+            # lib/Hoge/Fuga.pm -> t/Fuga.t (top-level only)
+            my $module_path = $1;
+            my $test_file1 = "t/$module_path.t";
+            my $test_file2 = sprintf("t/%s.t", $module_path =~ s{.*/}{}r);
+
+            if (-f $test_file1) {
+                push @test_files, $test_file1
+            }
+            if (-f $test_file2) {
+                push @test_files, $test_file2
+            }
+            else {
+                return (undef, WatchTest::Error::TestFileNotFound->new(message => "No corresponding test file found for changed module: $file"));
+            }
+        }
+    }
+
+    # Remove duplicates
+    my %seen;
+    @test_files = grep { !$seen{$_}++ } @test_files;
+
+    return (\@test_files, undef);
+}
+
+sub output($type, $message) {
+    my $fh = $type >= WARN ? *STDERR : *STDOUT;
+    print {$fh} $message;
+}
+
+sub is_installed($command) {
+    my $path = qx(which $command 2>/dev/null); ## no critic (InputOutput::ProhibitBacktickOperators)
+    chomp $path;
+    return $path ? 1 : 0;
+}
+
+class WatchTest::Error {
+    field $message :param;
+    method message() { $message }
+    method rethrow() { die $self; }
+    sub throw($class, $message) { die $class->new(message => $message); }
+}
+
+class WatchTest::Error::CommandNotFound :isa(WatchTest::Error);
+class WatchTest::Error::RequiredCommandNotInstalled :isa(WatchTest::Error);
+class WatchTest::Error::TestFileNotFound :isa(WatchTest::Error);
+class WatchTest::Error::UnexpectedEmitJSON :isa(WatchTest::Error);
+
