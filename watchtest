@@ -109,8 +109,23 @@ sub cmd_on_emit_events(@commands) {
         return;
     }
 
+    # Detect which functions are being edited
+    my @test_methods = detect_edited_functions(@$changed_files);
+    my $test_method_pattern;
+    if (@test_methods) {
+        # Create regex pattern: foo|bar|baz
+        $test_method_pattern = join('|', @test_methods);
+        output(INFO, "TEST_METHOD=$test_method_pattern\n");
+        $ENV{TEST_METHOD} = $test_method_pattern;
+    }
+
     # special case
     shift @commands if $commands[0] eq '--';
+
+    # Inject TEST_METHOD into docker commands if needed
+    if ($test_method_pattern) {
+        @commands = inject_env_to_docker_command(\@commands, 'TEST_METHOD', $test_method_pattern);
+    }
 
     exec @commands, @$test_files;
 }
@@ -198,12 +213,133 @@ sub determine_test_files_to_run(@changed_files) {
 sub output($type, $message) {
     my $fh = $type >= WARN ? *STDERR : *STDOUT;
     print {$fh} $message;
+    # Test comment to detect function changes
 }
 
 sub is_installed($command) {
     my $path = qx(which $command 2>/dev/null); ## no critic (InputOutput::ProhibitBacktickOperators)
     chomp $path;
     return $path ? 1 : 0;
+}
+
+# Inject environment variable into docker commands
+sub inject_env_to_docker_command($commands_ref, $env_name, $env_value) {
+    my @commands = @$commands_ref;
+
+    # Look for docker compose exec or docker exec patterns
+    for my $i (0 .. $#commands - 1) {
+        # Match: docker compose exec
+        if ($commands[$i] eq 'docker' && $commands[$i+1] eq 'compose' &&
+            defined $commands[$i+2] && $commands[$i+2] eq 'exec') {
+            # Insert -e ENV_NAME=value after 'exec'
+            splice @commands, $i+3, 0, '-e', "$env_name=$env_value";
+            last;
+        }
+        # Match: docker-compose exec
+        elsif ($commands[$i] eq 'docker-compose' &&
+               defined $commands[$i+1] && $commands[$i+1] eq 'exec') {
+            # Insert -e ENV_NAME=value after 'exec'
+            splice @commands, $i+2, 0, '-e', "$env_name=$env_value";
+            last;
+        }
+        # Match: docker exec
+        elsif ($commands[$i] eq 'docker' &&
+               defined $commands[$i+1] && $commands[$i+1] eq 'exec') {
+            # Insert -e ENV_NAME=value after 'exec'
+            splice @commands, $i+2, 0, '-e', "$env_name=$env_value";
+            last;
+        }
+    }
+
+    return @commands;
+}
+
+# Detect which functions are being edited in the changed files
+sub detect_edited_functions(@changed_files) {
+    my %all_functions;  # Use hash to automatically deduplicate
+
+    for my $file (@changed_files) {
+        next unless -f $file;
+
+        # Get the diff to find which lines were changed
+        # Try both staged and unstaged changes
+        my $diff_output = qx(git diff HEAD $file 2>/dev/null); ## no critic
+
+        # If no diff with HEAD (e.g., untracked file), try to get all content as "changed"
+        # For untracked files, we'll just use the last modified function
+        my @changed_lines;
+
+        if ($diff_output) {
+            # Parse the diff to find changed line numbers
+            for my $line (split /\n/, $diff_output) {
+                # Match diff hunk headers like: @@ -10,5 +10,6 @@
+                if ($line =~ /^\@\@\s+\-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+\@\@/) {
+                    my $start_line = $1;
+                    my $num_lines = $2 // 1;
+                    push @changed_lines, $start_line .. ($start_line + $num_lines - 1);
+                }
+            }
+        }
+
+        # Read the file content to find function definitions
+        open my $fh, '<', $file or next;
+        my @lines = <$fh>;
+        close $fh;
+
+        # If we have changed lines from diff, find ALL functions that contain them
+        if (@changed_lines) {
+            my $current_function;
+            my %matched_functions;
+
+            for my $line_num (1 .. @lines) {
+                my $line = $lines[$line_num - 1];
+
+                # Check if it's a test file (.t)
+                if ($file =~ /\.t$/) {
+                    # Look for sub foo : Tests { pattern
+                    if ($line =~ /sub\s+(\w+)\s*:\s*Tests\s*\{/) {
+                        $current_function = $1;
+                    }
+                }
+                # Check if it's a lib module (.pm in lib/)
+                elsif ($file =~ m{^lib/.*\.pm$}) {
+                    # Look for sub bar { pattern
+                    if ($line =~ /sub\s+(\w+)\s*\{/) {
+                        $current_function = $1;
+                    }
+                }
+
+                # Check if this line was changed and we have a current function
+                # Collect ALL matched functions
+                if ($current_function && grep { $_ == $line_num } @changed_lines) {
+                    $matched_functions{$current_function} = 1;
+                }
+            }
+
+            # Add to global hash (automatically deduplicates)
+            $all_functions{$_} = 1 for keys %matched_functions;
+        }
+        else {
+            # For untracked/new files, return the first function found
+            for my $line (@lines) {
+                if ($file =~ /\.t$/) {
+                    if ($line =~ /sub\s+(\w+)\s*:\s*Tests\s*\{/) {
+                        $all_functions{$1} = 1;
+                        last;
+                    }
+                }
+                elsif ($file =~ m{^lib/.*\.pm$}) {
+                    if ($line =~ /sub\s+(\w+)\s*\{/) {
+                        $all_functions{$1} = 1;
+                        last;
+                    }
+                }
+            }
+        }
+    }
+
+    # Return unique function names, sorted for consistency
+    return sort keys %all_functions;
 }
 
 class WatchTest::Error {
