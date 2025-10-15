@@ -174,7 +174,7 @@ sub determine_test_files_to_run(@changed_files) {
             # lib/Hoge/Fuga.pm -> t/Fuga.t (top-level only)
             my $module_path = $1;
             my $test_file1 = "t/$module_path.t";
-            my $test_file2 = sprintf("t/%s.t", $module_path =~ s{.*/}{}r);
+            my $test_file2 = sprintf("t/%s.t", $module_path =~ s{[^/]+/}{}r);
 
             if (-f $test_file1) {
                 push @test_files, $test_file1
@@ -183,7 +183,7 @@ sub determine_test_files_to_run(@changed_files) {
                 push @test_files, $test_file2
             }
             else {
-                return (undef, WatchTest::Error::TestFileNotFound->new(message => "No corresponding test file found for changed module: $file"));
+                return (undef, WatchTest::Error::TestFileNotFound->new(message => "No corresponding test file found for changed module: $file\n (Expected: $test_file1 or $test_file2)\n"));
             }
         }
     }
